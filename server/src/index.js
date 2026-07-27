@@ -33,35 +33,25 @@ const bad = (res, msg) => res.status(400).json({ error: msg });
 app.post("/api/auth/signup", async (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name?.trim()) return bad(res, "Name is required");
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || ""))
-    return bad(res, "Valid email is required");
-  if ((password || "").length < 6)
-    return bad(res, "Password must be at least 6 characters");
-  const exists = await q("select 1 from users where lower(email) = lower($1)", [
-    email,
-  ]);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || "")) return bad(res, "Valid email is required");
+  if ((password || "").length < 6) return bad(res, "Password must be at least 6 characters");
+  const exists = await q("select 1 from users where lower(email) = lower($1)", [email]);
   if (exists.rows.length) return bad(res, "That email is already registered");
   const hash = await hashPassword(password);
-  const u = await q(
-    "insert into users (name, email, password_hash) values ($1,$2,$3) returning id, name, email",
-    [name.trim(), email.trim(), hash],
-  );
+  const u = await q("insert into users (name, email, password_hash) values ($1,$2,$3) returning id, name, email", [name.trim(), email.trim(), hash]);
   await ensureHousehold(u.rows[0]);
-  setSession(res, u.rows[0]);
-  res.json({ user: u.rows[0] });
+  const token = setSession(res, u.rows[0]);
+  res.json({ token, user: u.rows[0] });
 });
 
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
-  const found = await q("select * from users where lower(email) = lower($1)", [
-    email || "",
-  ]);
+  const found = await q("select * from users where lower(email) = lower($1)", [email || ""]);
   const user = found.rows[0];
-  if (!user || !(await checkPassword(password || "", user.password_hash)))
-    return res.status(401).json({ error: "Wrong email or password" });
+  if (!user || !(await checkPassword(password || "", user.password_hash))) return res.status(401).json({ error: "Wrong email or password" });
   await ensureHousehold(user);
-  setSession(res, user);
-  res.json({ user: { id: user.id, name: user.name, email: user.email } });
+  const token = setSession(res, user);
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -70,23 +60,18 @@ app.post("/api/auth/logout", (req, res) => {
 });
 
 app.get("/api/auth/me", requireAuth, async (req, res) => {
-  const hh = await q("select * from households where id = $1", [
-    req.householdId,
-  ]);
+  const hh = await q("select * from households where id = $1", [req.householdId]);
   res.json({ user: req.user, role: req.role, household: hh.rows[0] });
 });
 
-app.get("/api/auth/providers", (req, res) =>
-  res.json({ google: google.configured(), github: github.configured() }),
-);
+app.get("/api/auth/providers", (req, res) => res.json({ google: google.configured(), github: github.configured() }));
 
 for (const [name, provider] of [
   ["google", google],
   ["github", github],
 ]) {
   app.get(`/api/auth/${name}`, (req, res) => {
-    if (!provider.configured())
-      return res.redirect(`${CLIENT}/?error=${name}_not_configured`);
+    if (!provider.configured()) return res.redirect(`${CLIENT}/?error=${name}_not_configured`);
     res.redirect(provider.authUrl(name));
   });
   app.get(`/api/auth/${name}/callback`, async (req, res) => {
@@ -94,8 +79,8 @@ for (const [name, provider] of [
       const profile = await provider.profile(req.query.code);
       const user = await findOrCreateOAuthUser(profile);
       await ensureHousehold(user);
-      setSession(res, user);
-      res.redirect(CLIENT);
+      const token = setSession(res, user);
+      res.redirect(`${CLIENT}/?token=${token}`);
     } catch (err) {
       console.error(err);
       res.redirect(`${CLIENT}/?error=${name}_sign_in_failed`);
@@ -106,21 +91,12 @@ for (const [name, provider] of [
 /* ─────────────── settings ─────────────── */
 
 app.get("/api/settings", requireAuth, async (req, res) => {
-  const hh = await q("select * from households where id = $1", [
-    req.householdId,
-  ]);
+  const hh = await q("select * from households where id = $1", [req.householdId]);
   res.json(hh.rows[0]);
 });
 
 app.put("/api/settings", requireAuth, requireOwner, async (req, res) => {
-  const {
-    default_budget,
-    currency,
-    alert_threshold,
-    notify_over,
-    notify_weekly,
-    notify_adds,
-  } = req.body || {};
+  const { default_budget, currency, alert_threshold, notify_over, notify_weekly, notify_adds } = req.body || {};
   const hh = await q(
     `update households set
        default_budget  = coalesce($2, default_budget),
@@ -146,9 +122,7 @@ app.put("/api/settings", requireAuth, requireOwner, async (req, res) => {
 /* ─────────────── budgets ─────────────── */
 
 app.get("/api/budgets", requireAuth, async (req, res) => {
-  const hh = await q("select default_budget from households where id = $1", [
-    req.householdId,
-  ]);
+  const hh = await q("select default_budget from households where id = $1", [req.householdId]);
   const rows = await q(
     `select b.month,
             b.amount,
@@ -165,8 +139,7 @@ app.get("/api/budgets", requireAuth, async (req, res) => {
 
 app.put("/api/budgets/:month", requireAuth, requireOwner, async (req, res) => {
   const month = req.params.month;
-  if (!/^\d{4}-\d{2}$/.test(month))
-    return bad(res, "Month must look like 2026-07");
+  if (!/^\d{4}-\d{2}$/.test(month)) return bad(res, "Month must look like 2026-07");
   const amount = num(req.body?.amount);
   if (amount <= 0) return bad(res, "Amount must be greater than zero");
   const row = await q(
@@ -177,18 +150,10 @@ app.put("/api/budgets/:month", requireAuth, requireOwner, async (req, res) => {
   res.json(row.rows[0]);
 });
 
-app.delete(
-  "/api/budgets/:month",
-  requireAuth,
-  requireOwner,
-  async (req, res) => {
-    await q(
-      "delete from monthly_budgets where household_id = $1 and month = $2",
-      [req.householdId, req.params.month],
-    );
-    res.json({ ok: true });
-  },
-);
+app.delete("/api/budgets/:month", requireAuth, requireOwner, async (req, res) => {
+  await q("delete from monthly_budgets where household_id = $1 and month = $2", [req.householdId, req.params.month]);
+  res.json({ ok: true });
+});
 
 /* ─────────────── expenses ─────────────── */
 
@@ -205,26 +170,14 @@ app.get("/api/expenses", requireAuth, async (req, res) => {
 });
 
 app.post("/api/expenses", requireAuth, requireEdit, async (req, res) => {
-  const { amount, category, spent_on, note, method, recurring, receipt_url } =
-    req.body || {};
+  const { amount, category, spent_on, note, method, recurring, receipt_url } = req.body || {};
   if (num(amount) <= 0) return bad(res, "Amount must be greater than zero");
   if (!category) return bad(res, "Category is required");
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(spent_on || ""))
-    return bad(res, "Date must look like 2026-07-25");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(spent_on || "")) return bad(res, "Date must look like 2026-07-25");
   const row = await q(
     `insert into expenses (household_id, user_id, amount, category, spent_on, note, method, recurring, receipt_url)
      values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`,
-    [
-      req.householdId,
-      req.user.id,
-      num(amount),
-      category,
-      spent_on,
-      note || "",
-      method || "Card",
-      !!recurring,
-      receipt_url || null,
-    ],
+    [req.householdId, req.user.id, num(amount), category, spent_on, note || "", method || "Card", !!recurring, receipt_url || null],
   );
   await checkThreshold(req.householdId, monthOf(spent_on));
   res.json({
@@ -235,10 +188,7 @@ app.post("/api/expenses", requireAuth, requireEdit, async (req, res) => {
 });
 
 app.delete("/api/expenses/:id", requireAuth, requireEdit, async (req, res) => {
-  await q("delete from expenses where id = $1 and household_id = $2", [
-    req.params.id,
-    req.householdId,
-  ]);
+  await q("delete from expenses where id = $1 and household_id = $2", [req.params.id, req.householdId]);
   res.json({ ok: true });
 });
 
@@ -246,17 +196,10 @@ app.delete("/api/expenses/:id", requireAuth, requireEdit, async (req, res) => {
 
 app.get("/api/summary", requireAuth, async (req, res) => {
   const month = req.query.month || monthOf(new Date().toISOString());
-  const hh = (
-    await q("select * from households where id = $1", [req.householdId])
-  ).rows[0];
+  const hh = (await q("select * from households where id = $1", [req.householdId])).rows[0];
 
-  const budgetRow = await q(
-    "select amount from monthly_budgets where household_id = $1 and month = $2",
-    [req.householdId, month],
-  );
-  const budget = budgetRow.rows.length
-    ? num(budgetRow.rows[0].amount)
-    : num(hh.default_budget);
+  const budgetRow = await q("select amount from monthly_budgets where household_id = $1 and month = $2", [req.householdId, month]);
+  const budget = budgetRow.rows.length ? num(budgetRow.rows[0].amount) : num(hh.default_budget);
 
   const totals = await q(
     `select coalesce(sum(amount),0) as spent, count(*) as count from expenses
@@ -322,10 +265,7 @@ app.get("/api/members", requireAuth, async (req, res) => {
       order by (m.role = 'owner') desc, u.name`,
     [req.householdId, month],
   );
-  const invites = await q(
-    "select id, email, role from invites where household_id = $1 order by id",
-    [req.householdId],
-  );
+  const invites = await q("select id, email, role from invites where household_id = $1 order by id", [req.householdId]);
   res.json({
     members: members.rows.map((r) => ({ ...r, spent: num(r.spent) })),
     invites: invites.rows,
@@ -334,39 +274,23 @@ app.get("/api/members", requireAuth, async (req, res) => {
 
 app.put("/api/members/:id", requireAuth, requireOwner, async (req, res) => {
   const role = req.body?.role;
-  if (!["edit", "view"].includes(role))
-    return bad(res, "Role must be edit or view");
-  const owner = await q(
-    "select role from memberships where household_id = $1 and user_id = $2",
-    [req.householdId, req.params.id],
-  );
-  if (owner.rows[0]?.role === "owner")
-    return bad(res, "The owner's role cannot be changed");
-  await q(
-    "update memberships set role = $3 where household_id = $1 and user_id = $2",
-    [req.householdId, req.params.id, role],
-  );
+  if (!["edit", "view"].includes(role)) return bad(res, "Role must be edit or view");
+  const owner = await q("select role from memberships where household_id = $1 and user_id = $2", [req.householdId, req.params.id]);
+  if (owner.rows[0]?.role === "owner") return bad(res, "The owner's role cannot be changed");
+  await q("update memberships set role = $3 where household_id = $1 and user_id = $2", [req.householdId, req.params.id, role]);
   res.json({ ok: true });
 });
 
 app.delete("/api/members/:id", requireAuth, requireOwner, async (req, res) => {
-  const m = await q(
-    "select role from memberships where household_id = $1 and user_id = $2",
-    [req.householdId, req.params.id],
-  );
-  if (m.rows[0]?.role === "owner")
-    return bad(res, "The owner cannot be removed");
-  await q("delete from memberships where household_id = $1 and user_id = $2", [
-    req.householdId,
-    req.params.id,
-  ]);
+  const m = await q("select role from memberships where household_id = $1 and user_id = $2", [req.householdId, req.params.id]);
+  if (m.rows[0]?.role === "owner") return bad(res, "The owner cannot be removed");
+  await q("delete from memberships where household_id = $1 and user_id = $2", [req.householdId, req.params.id]);
   res.json({ ok: true });
 });
 
 app.post("/api/invites", requireAuth, requireOwner, async (req, res) => {
   const { email, role } = req.body || {};
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || ""))
-    return bad(res, "Valid email is required");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || "")) return bad(res, "Valid email is required");
   const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
   const existing = await q(
     `select 1 from memberships m join users u on u.id = m.user_id
@@ -374,10 +298,12 @@ app.post("/api/invites", requireAuth, requireOwner, async (req, res) => {
     [req.householdId, email],
   );
   if (existing.rows.length) return bad(res, "That person is already a member");
-  const row = await q(
-    "insert into invites (household_id, email, role, token) values ($1,$2,$3,$4) returning id, email, role",
-    [req.householdId, email.trim(), role === "view" ? "view" : "edit", token],
-  );
+  const row = await q("insert into invites (household_id, email, role, token) values ($1,$2,$3,$4) returning id, email, role", [
+    req.householdId,
+    email.trim(),
+    role === "view" ? "view" : "edit",
+    token,
+  ]);
   try {
     await sendMail({
       to: [email],
@@ -386,29 +312,22 @@ app.post("/api/invites", requireAuth, requireOwner, async (req, res) => {
     });
     res.json(row.rows[0]);
   } catch (error) {
-    console.error("Invite email failed:", e.message);
-    res.json({ message: e.message });
+    console.error("Invite email failed:", error.message);
+    res.json(row.rows[0]);
   }
 });
 
 app.delete("/api/invites/:id", requireAuth, requireOwner, async (req, res) => {
-  await q("delete from invites where id = $1 and household_id = $2", [
-    req.params.id,
-    req.householdId,
-  ]);
+  await q("delete from invites where id = $1 and household_id = $2", [req.params.id, req.householdId]);
   res.json({ ok: true });
 });
 
 /* ─────────────── threshold email alerts ─────────────── */
 
 async function checkThreshold(householdId, month) {
-  const hh = (await q("select * from households where id = $1", [householdId]))
-    .rows[0];
+  const hh = (await q("select * from households where id = $1", [householdId])).rows[0];
   if (!hh?.notify_over) return;
-  const b = await q(
-    "select amount from monthly_budgets where household_id = $1 and month = $2",
-    [householdId, month],
-  );
+  const b = await q("select amount from monthly_budgets where household_id = $1 and month = $2", [householdId, month]);
   const budget = b.rows.length ? num(b.rows[0].amount) : num(hh.default_budget);
   if (budget <= 0) return;
   const t = await q(
@@ -417,34 +336,20 @@ async function checkThreshold(householdId, month) {
     [householdId, month],
   );
   const pct = (num(t.rows[0].spent) / budget) * 100;
-  const level =
-    pct >= 100 ? 100 : pct >= hh.alert_threshold ? hh.alert_threshold : 0;
+  const level = pct >= 100 ? 100 : pct >= hh.alert_threshold ? hh.alert_threshold : 0;
   if (!level) return;
-  const already = await q(
-    "select 1 from alerts_sent where household_id = $1 and month = $2 and level = $3",
-    [householdId, month, level],
-  );
+  const already = await q("select 1 from alerts_sent where household_id = $1 and month = $2 and level = $3", [householdId, month, level]);
   if (already.rows.length) return;
-  await q(
-    "insert into alerts_sent (household_id, month, level) values ($1,$2,$3)",
-    [householdId, month, level],
-  );
-  const people = await q(
-    "select u.email from memberships m join users u on u.id = m.user_id where m.household_id = $1",
-    [householdId],
-  );
+  await q("insert into alerts_sent (household_id, month, level) values ($1,$2,$3)", [householdId, month, level]);
+  const people = await q("select u.email from memberships m join users u on u.id = m.user_id where m.household_id = $1", [householdId]);
   try {
     await sendMail({
       to: people.rows.map((r) => r.email),
-      subject:
-        level >= 100
-          ? `Over budget for ${month}`
-          : `${Math.round(pct)}% of the ${month} budget used`,
+      subject: level >= 100 ? `Over budget for ${month}` : `${Math.round(pct)}% of the ${month} budget used`,
       text: `Spent ${num(t.rows[0].spent)} of ${budget} (${Math.round(pct)}%) for ${month}.`,
     });
-  } catch {
-    console.error("Alert service failed:", e.message);
-    res.json({ message: e.message });
+  } catch (error) {
+    console.error("Alert service failed:", error.message);
   }
 }
 
@@ -458,6 +363,4 @@ app.use((err, req, res, next) => {
 });
 
 const port = Number(process.env.PORT || 4000);
-app.listen(port, () =>
-  console.log("API listening on http://localhost:" + port),
-);
+app.listen(port, () => console.log("API listening on http://localhost:" + port));
