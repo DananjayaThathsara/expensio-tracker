@@ -276,12 +276,18 @@ app.post('/api/invites', requireAuth, requireOwner, async (req, res) => {
     'insert into invites (household_id, email, role, token) values ($1,$2,$3,$4) returning id, email, role',
     [req.householdId, email.trim(), role === 'view' ? 'view' : 'edit', token]
   );
-  await sendMail({
+  try {
+    await sendMail({
     to: [email],
     subject: 'You have been invited to a shared budget',
     text: `Join the budget here: ${CLIENT}/?invite=${token}\n\nSign up with this email address (${email}) and you will be added automatically.`
   });
   res.json(row.rows[0]);
+  } catch (error) {
+    console.error('Invite email failed:', e.message);
+    res.json({"message":e.message});
+  }
+
 });
 
 app.delete('/api/invites/:id', requireAuth, requireOwner, async (req, res) => {
